@@ -1,0 +1,22 @@
+[Unit]
+Description=DSH Remote Relay Server
+After=network.target
+
+[Service]
+Type=simple
+User=dshremote
+Group=dshremote
+WorkingDirectory=/opt/dsh-remote-server
+EnvironmentFile=/etc/default/dsh-remote-server
+ExecStart=/opt/dsh-remote-server/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080 --proxy-headers
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dsh-remote
+
+[Install]
+WantedBy=multi-user.target
