@@ -442,8 +442,14 @@ async def ws_connect(websocket: WebSocket):
             old = connections.get(device_id)
             connections[device_id] = session
         if old:
-            await old.send("error", {"code": "CONNECTION_REPLACED", "message": "New device session connected."})
-            await old.websocket.close(code=1012)
+            try:
+                await old.send("error", {"code": "CONNECTION_REPLACED", "message": "New device session connected."})
+            except Exception:
+                pass
+            try:
+                await old.websocket.close(code=1012)
+            except Exception:
+                pass
         negotiated = sorted(capabilities.intersection(SERVER_CAPABILITIES))
         await session.send("hello.ack", {"protocol": 1, "serverVersion": "0.1.0", "connectionSessionId": str(uuid.uuid4()),
                                           "heartbeatIntervalMs": HEARTBEAT_INTERVAL_MS, "maxControlFrameBytes": MAX_CONTROL_FRAME_BYTES,
