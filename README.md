@@ -73,6 +73,10 @@ sudo chmod 600 /etc/default/dsh-remote-server
 sudo mkdir -p /var/lib/dsh-remote
 ```
 
+Optional: `DSH_REMOTE_REFRESH_GRACE_SECONDS` (default `600`) sets how long a refresh token that has
+already been rotated is still accepted. Refresh tokens are single-use, so without this window a client
+that loses (or fails to persist) the rotation response is locked out permanently.
+
 ### 3. Initialize an Admin Account
 
 ```bash

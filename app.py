@@ -30,6 +30,9 @@ MAX_CONTROL_FRAME_BYTES = 64 * 1024
 MAX_RELAY_FRAME_BYTES = 1024 * 1024
 ACCESS_TTL_SECONDS = 15 * 60
 REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60
+# A rotated refresh token stays usable for this long after rotation, so a client that
+# lost (or failed to persist) the rotation response can retry instead of being orphaned.
+REFRESH_GRACE_SECONDS = int(os.environ.get("DSH_REMOTE_REFRESH_GRACE_SECONDS", "600"))
 HEARTBEAT_INTERVAL_MS = 25_000
 HEARTBEAT_TIMEOUT_SECONDS = 75
 SERVER_CAPABILITIES = [
@@ -319,12 +322,19 @@ def revoke_self(request: Request) -> dict[str, Any]:
 def refresh(body: RefreshRequest) -> dict[str, Any]:
     with db() as conn:
         row = conn.execute("SELECT * FROM refresh_tokens WHERE token_hash=?", (token_hash(body.refreshToken),)).fetchone()
-        if not row or row["device_id"] != body.deviceId or row["revoked_at"] or row["expires_at"] < now_ms():
+        now = now_ms()
+        if not row or row["device_id"] != body.deviceId or row["expires_at"] < now:
+            raise HTTPException(401, detail=error("INVALID_TOKEN", "Invalid refresh token."))
+        # Rotated tokens are accepted within the grace window; revoke_self also revokes the
+        # device itself, so the device check below still rejects those.
+        if row["revoked_at"] and now - row["revoked_at"] > REFRESH_GRACE_SECONDS * 1000:
             raise HTTPException(401, detail=error("INVALID_TOKEN", "Invalid refresh token."))
         device = conn.execute("SELECT * FROM devices WHERE device_id=? AND revoked_at IS NULL", (body.deviceId,)).fetchone()
         if not device:
             raise HTTPException(401, detail=error("INVALID_TOKEN", "Device is unavailable."))
-        conn.execute("UPDATE refresh_tokens SET revoked_at=? WHERE token_hash=?", (now_ms(), row["token_hash"]))
+        if not row["revoked_at"]:
+            # Keep the original rotation time on replays so the grace window never slides.
+            conn.execute("UPDATE refresh_tokens SET revoked_at=? WHERE token_hash=?", (now, row["token_hash"]))
         tokens = issue_tokens(conn, body.deviceId)
         conn.commit()
     tokens["accessToken"] = access_token(body.deviceId, device["owner_email"], device["role"])
