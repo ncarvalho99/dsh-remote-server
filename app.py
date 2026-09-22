@@ -438,7 +438,7 @@ async def ws_connect(websocket: WebSocket):
         if type_ != "hello":
             raise ValueError("hello required")
         device_id, owner, role = parse_access_token(str(payload.get("accessToken", "")))
-        if payload.get("deviceId") != device_id or payload.get("role") != role or 1 not in payload.get("protocols", []):
+        if payload.get("deviceId") != device_id or payload.get("role", role) != role or 1 not in payload.get("protocols", []):
             raise ValueError("Invalid hello authorization")
         capabilities = set(payload.get("capabilities", []))
         with db() as conn:
