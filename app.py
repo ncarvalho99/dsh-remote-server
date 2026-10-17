@@ -47,7 +47,21 @@ SERVER_CAPABILITIES = [
     "fileviewer.read.v1",
     "codex.appserver.v1",
     "codex.appserver.transfer.v1",
+    # Advertised by ds-harness-remote 0.5.x Hosts; negotiation only gates transports, so these are informational.
+    "harness.remote.v3",
+    "harness.terminal.v1",
+    "agent.acp.v1",
+    "agent.acp.transfer.v1",
+    "agent.acp.terminal.v1",
+    "agent.acp.antigravity.models.v1",
+    "plugin.route.v1",
 ]
+SERVER_VERSION = "0.2.0"
+# WebSocket close codes the ds-harness-remote client maps to specific recovery paths.
+CLOSE_AUTH_INVALID = 4002  # refresh credentials and retry hello once
+CLOSE_CONNECTION_REPLACED = 4003  # another instance took this identity; client stops reconnecting
+CLOSE_DEVICE_REVOKED = 4004  # client clears its authorization; next account login rotates the identity
+CLOSE_UNSUPPORTED_VERSION = 4011
 DB_PATH = Path(os.environ.get("DSH_REMOTE_DB", "/var/lib/dsh-remote/server.sqlite3"))
 PEPPER = os.environ.get("DSH_REMOTE_TOKEN_PEPPER")
 if not PEPPER:
@@ -203,7 +217,11 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="DSH Remote Relay", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="DSH Remote Relay", version=SERVER_VERSION, lifespan=lifespan)
+
+
+def device_revoked() -> HTTPException:
+    return HTTPException(403, detail=error("DEVICE_REVOKED", "This device was revoked; authorize again with a new identity."))
 
 
 @app.exception_handler(HTTPException)
@@ -251,6 +269,12 @@ def login(body: LoginRequest) -> dict[str, Any]:
             "account": row["email"], "profile": {}, "isAdmin": bool(row["is_admin"])}
 
 
+@app.get("/api/v1/auth/oauth/providers")
+def oauth_providers() -> dict[str, Any]:
+    # Account (email/password) login only; an empty list stops 0.5.x clients probing legacy OAuth routes.
+    return {"items": []}
+
+
 @app.post("/api/v1/devices/register")
 def register(body: RegisterRequest, request: Request) -> dict[str, Any]:
     _, owner, role = auth_from_request(request)
@@ -258,11 +282,18 @@ def register(body: RegisterRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(400, detail=error("UNSUPPORTED_VERSION", "Account authorization and protocol version 1 required."))
     if body.device.role not in ("host", "client"):
         raise HTTPException(400, detail=error("INVALID_MESSAGE", "Invalid device role."))
+    return upsert_device(body, owner)
+
+
+def upsert_device(body: RegisterRequest, owner: str) -> dict[str, Any]:
     now = now_ms()
     with db() as conn:
         existing = conn.execute("SELECT * FROM devices WHERE device_id=?", (body.device.deviceId,)).fetchone()
         if existing and (existing["owner_email"] != owner or existing["role"] != body.device.role or existing["identity_key"] != body.device.identityKey):
             raise HTTPException(409, detail=error("INVALID_MESSAGE", "Device identity cannot be reassigned."))
+        if existing and existing["revoked_at"]:
+            # Revocation is permanent; ds-harness-remote 0.5.x rotates its identity on this code.
+            raise device_revoked()
         conn.execute(
             """INSERT INTO devices(device_id,owner_email,name,role,platform,identity_key,client_version,harness_version,created_at,last_seen_at)
                VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -286,24 +317,11 @@ def register_owned_role(body: RegisterRequest, request: Request) -> dict[str, An
         raise HTTPException(400, detail=error("UNSUPPORTED_VERSION", "Device authorization and protocol version 1 required."))
     if body.device.role not in ("host", "client") or body.device.role == caller_role:
         raise HTTPException(400, detail=error("INVALID_MESSAGE", "Must register opposite device role."))
-    
-    now = now_ms()
     with db() as conn:
-        existing = conn.execute("SELECT * FROM devices WHERE device_id=?", (body.device.deviceId,)).fetchone()
-        if existing and (existing["owner_email"] != owner or existing["role"] != body.device.role or existing["identity_key"] != body.device.identityKey):
-            raise HTTPException(409, detail=error("INVALID_MESSAGE", "Device identity cannot be reassigned."))
-        conn.execute(
-            """INSERT INTO devices(device_id,owner_email,name,role,platform,identity_key,client_version,harness_version,created_at,last_seen_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(device_id) DO UPDATE SET name=excluded.name, platform=excluded.platform, client_version=excluded.client_version,
-                 harness_version=excluded.harness_version, last_seen_at=excluded.last_seen_at""",
-            (body.device.deviceId, owner, body.device.name, body.device.role, body.device.platform, body.device.identityKey,
-             body.device.clientVersion, body.device.harnessVersion, now, now),
-        )
-        tokens = issue_tokens(conn, body.device.deviceId)
-        conn.commit()
-    tokens["accessToken"] = access_token(body.device.deviceId, owner, body.device.role)
-    return tokens
+        caller = conn.execute("SELECT revoked_at FROM devices WHERE device_id=?", (caller_device_id,)).fetchone()
+    if not caller or caller["revoked_at"]:
+        raise device_revoked()
+    return upsert_device(body, owner)
 
 
 @app.delete("/api/v1/devices/self")
@@ -325,13 +343,14 @@ def refresh(body: RefreshRequest) -> dict[str, Any]:
         now = now_ms()
         if not row or row["device_id"] != body.deviceId or row["expires_at"] < now:
             raise HTTPException(401, detail=error("INVALID_TOKEN", "Invalid refresh token."))
-        # Rotated tokens are accepted within the grace window; revoke_self also revokes the
-        # device itself, so the device check below still rejects those.
+        # A genuine (hash-matched) refresh token of a revoked device reports the revocation itself,
+        # so the client clears its authorization instead of retrying forever.
+        device = conn.execute("SELECT * FROM devices WHERE device_id=?", (body.deviceId,)).fetchone()
+        if not device or device["revoked_at"]:
+            raise device_revoked()
+        # Rotated tokens are accepted within the grace window.
         if row["revoked_at"] and now - row["revoked_at"] > REFRESH_GRACE_SECONDS * 1000:
             raise HTTPException(401, detail=error("INVALID_TOKEN", "Invalid refresh token."))
-        device = conn.execute("SELECT * FROM devices WHERE device_id=? AND revoked_at IS NULL", (body.deviceId,)).fetchone()
-        if not device:
-            raise HTTPException(401, detail=error("INVALID_TOKEN", "Device is unavailable."))
         if not row["revoked_at"]:
             # Keep the original rotation time on replays so the grace window never slides.
             conn.execute("UPDATE refresh_tokens SET revoked_at=? WHERE token_hash=?", (now, row["token_hash"]))
@@ -437,15 +456,31 @@ async def ws_connect(websocket: WebSocket):
         type_, payload = valid_frame(json.loads(raw))
         if type_ != "hello":
             raise ValueError("hello required")
-        device_id, owner, role = parse_access_token(str(payload.get("accessToken", "")))
-        if payload.get("deviceId") != device_id or payload.get("role", role) != role or 1 not in payload.get("protocols", []):
+        try:
+            device_id, owner, role = parse_access_token(str(payload.get("accessToken", "")))
+        except HTTPException:
+            await websocket.close(code=CLOSE_AUTH_INVALID, reason="access token invalid or expired")
+            return
+        if payload.get("deviceId") != device_id or payload.get("role", role) != role:
             raise ValueError("Invalid hello authorization")
+        if 1 not in payload.get("protocols", []):
+            await websocket.close(code=CLOSE_UNSUPPORTED_VERSION, reason="protocol 1 required")
+            return
         capabilities = set(payload.get("capabilities", []))
         with db() as conn:
-            device = conn.execute("SELECT * FROM devices WHERE device_id=? AND owner_email=? AND role=? AND revoked_at IS NULL", (device_id, owner, role)).fetchone()
-            if not device:
-                raise ValueError("Unknown or revoked device")
-            conn.execute("UPDATE devices SET last_seen_at=? WHERE device_id=?", (now_ms(), device_id))
+            device = conn.execute("SELECT * FROM devices WHERE device_id=?", (device_id,)).fetchone()
+            if not device or device["revoked_at"]:
+                await websocket.close(code=CLOSE_DEVICE_REVOKED, reason="device revoked")
+                return
+            if device["owner_email"] != owner or device["role"] != role:
+                raise ValueError("Device does not match its access token")
+            # Hosts report their current versions on every hello; keep the device list truthful
+            # (clients fall back to clientVersion when a Host cannot describe its features).
+            versions = {key: payload.get(key) for key in ("clientVersion", "harnessVersion")}
+            client_version = versions["clientVersion"] if isinstance(versions["clientVersion"], str) and 0 < len(versions["clientVersion"]) <= 64 else device["client_version"]
+            harness_version = versions["harnessVersion"] if isinstance(versions["harnessVersion"], str) and 0 < len(versions["harnessVersion"]) <= 64 else device["harness_version"]
+            conn.execute("UPDATE devices SET last_seen_at=?, client_version=?, harness_version=? WHERE device_id=?",
+                         (now_ms(), client_version, harness_version, device_id))
             conn.commit()
         session = Session(websocket, device_id, owner, role, capabilities)
         async with connections_lock:
@@ -457,11 +492,11 @@ async def ws_connect(websocket: WebSocket):
             except Exception:
                 pass
             try:
-                await old.websocket.close(code=1012)
+                await old.websocket.close(code=CLOSE_CONNECTION_REPLACED, reason="connection replaced")
             except Exception:
                 pass
         negotiated = sorted(capabilities.intersection(SERVER_CAPABILITIES))
-        await session.send("hello.ack", {"protocol": 1, "serverVersion": "0.1.0", "connectionSessionId": str(uuid.uuid4()),
+        await session.send("hello.ack", {"protocol": 1, "serverVersion": SERVER_VERSION, "connectionSessionId": str(uuid.uuid4()),
                                           "heartbeatIntervalMs": HEARTBEAT_INTERVAL_MS, "maxControlFrameBytes": MAX_CONTROL_FRAME_BYTES,
                                           "maxRelayFrameBytes": MAX_RELAY_FRAME_BYTES, "capabilities": negotiated, "webrtcEnabled": False})
         task = asyncio.create_task(heartbeat(session))
