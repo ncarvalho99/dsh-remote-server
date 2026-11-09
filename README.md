@@ -26,9 +26,14 @@ It provides the complete control, auth, and encrypted relay infrastructure neede
   - `DELETE /api/v1/devices/self` — Device revocation
 - **Opaque WebSocket Relay Gateway (`/ws/v1/connect`):**
   - Protocol v1 `hello` / `hello.ack` capability negotiation
-  - Connection lifecycle (`connect.request`, `connect.incoming`, `connect.accepted`)
+  - Connection lifecycle (`connect.request`, `connect.incoming`, `connect.accepted`, `connect.rejected`); Host refusals and per-connection errors are forwarded to the client, and requests a Host never answers expire after 60 s
+  - Resume leases (`transport.relay.resume.v1`): `connection.lease.request`/`ack`/`close` with rotating 5-minute tickets; a Host or client presenting live `recoveryTickets` in `hello` keeps its tunnels across a control reconnect (stale tickets close with `4012`)
   - WebRTC signaling (`signal.offer`, `signal.answer`, `signal.ice`) and transport negotiation
   - Bidirectional encrypted relay transport with bounded frame checks and 25s ping/pong heartbeats
+- **Relay data sockets (`/ws/v1/relay`, `transport.relay.attach`, ds-harness-remote 0.6.x):**
+  - Per-connection data socket: `relay.attach` with a single-use ticket → `relay.ready`, then `relay` frames; `relay.detach` tells the peer when the tunnel ends
+  - Interoperates with 0.5.x peers that keep relaying over the control socket
+  - Tunnel lifecycle and unsupported frame types are logged at INFO (truncated ids, never payloads)
 - **CLI Utilities:**
   - `init_user.py` — Add or update user accounts directly in SQLite
   - `generate_code.py` — Generate single-use, 10-minute host pairing codes
@@ -76,6 +81,10 @@ sudo mkdir -p /var/lib/dsh-remote
 Optional: `DSH_REMOTE_REFRESH_GRACE_SECONDS` (default `600`) sets how long a refresh token that has
 already been rotated is still accepted. Refresh tokens are single-use, so without this window a client
 that loses (or fails to persist) the rotation response is locked out permanently.
+
+Optional: `DSH_REMOTE_PUBLIC_URL` (e.g. `https://dsh-remote.example.com`) is the public base URL used to
+advertise the relay data socket (`wss://…/ws/v1/relay`). When unset it is derived from the
+`X-Forwarded-Host`/`Host` and `X-Forwarded-Proto` headers.
 
 ### 3. Initialize an Admin Account
 
@@ -164,3 +173,12 @@ Then sign in with your email and password.
 ## 📄 License
 
 MIT License — see [LICENSE](LICENSE) for details.
+
+## Tests
+
+```bash
+python tests/test_protocol_0_5.py   # 0.5.x contract against a disposable relay
+python tests/test_protocol_0_6.py   # relay data sockets, leases, recovery, rejection forwarding
+# Optional, with a real ds-harness-remote install (Host + Client runtimes over a loopback relay):
+DSH_REMOTE_PKG=<.../node_modules/ds-harness-remote> DSH_HOME_PACKAGES=<DSH install node_modules> RELAY_PYTHON=<python with requirements> node tests/e2e_ds_harness_remote.mjs
+```
